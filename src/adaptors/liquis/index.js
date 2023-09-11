@@ -8,6 +8,10 @@ const hub = '0xb5087f95643a9a4069471a28d32c569d9bd57fe4';
 const lens = '0xb73f303472c4fd4ff3b9f59ce0f9b13e47fbfd19';
 const zeroAddress = '0x0000000000000000000000000000000000000000';
 
+const voterProxy = {
+  ethereum: '0x37aeB332D6E57112f1BFE36923a7ee670Ee9278b'
+}
+
 const viewHelper = {
   ethereum: '0xD58dd6deF2d0e8E16ffc537c7f269719e19b9fE4',
 }
@@ -168,6 +172,10 @@ const topLvl = async (chainString, url, timestamp) => {
     if (lit[chainString] && !tokens.includes(lit[chainString]))
       tokens.push(lit[chainString]);
 
+    // add LIQ to the token list
+    if (liq[chainString] && !tokens.includes(liq[chainString]))
+      tokens.push(liq[chainString]);
+
     // create of list of gauges
     const gauges = dataNow.reduce((gauges, b) => {
       if (b.gauge) gauges.push(b.gauge);
@@ -184,6 +192,8 @@ const topLvl = async (chainString, url, timestamp) => {
       { output: reserves },
       { output: shares },
       { output: gaugesWorkingSupply },
+      { output: gaugesTotalSupply },
+      { output: gaugesWorkingBalance }
       { output: gaugesTokenlessProduction },
       { output: gaugesIsKilled },
       { output: gaugesRelativeWeight },
@@ -228,6 +238,18 @@ const topLvl = async (chainString, url, timestamp) => {
         sdk.api.abi.multiCall({
           abi: gaugeABI.find((n) => n.name === 'working_supply'),
           calls: gauges.map((gauge) => ({ target: gauge })),
+          chain: chainString,
+        }),
+      gauges.length &&
+        sdk.api.abi.multiCall({
+          abi: gaugeABI.find((n) => n.name === 'totalSupply'),
+          calls: gauges.map((gauge) => ({ target: gauge })),
+          chain: chainString,
+        }),
+      gauges.length &&
+        sdk.api.abi.multiCall({
+          abi: gaugeABI.find((n) => n.name === 'working_balances'),
+          calls: gauges.map((gauge) => ({ target: gauge, params: [voterProxy[chainString]] })),
           chain: chainString,
         }),
       gauges.length &&
@@ -325,10 +347,10 @@ const topLvl = async (chainString, url, timestamp) => {
       const tickLower = parseInt(b.ticks[0]);
       const tickUpper = parseInt(b.ticks[1]);
       const tick = parseInt(b.pool.tick);
-      const totalSupply = poolTotalSupply.find(
+      const poolTotalSupply = poolTotalSupply.find(
         (t) => t.input.target == b.lptoken
       ).output;
-      let tvl = totalSupply == 0 ? 0 : (token0Reserve * token0Price + token1Reserve * token1Price) * (b.totalSupply / totalSupply);
+      let tvl = poolTotalSupply == 0 ? 0 : (token0Reserve * token0Price + token1Reserve * token1Price) * (b.totalSupply / poolTotalSupply);
 
       if (
         parseInt(b.pool.liquidity) > 0
@@ -378,34 +400,54 @@ const topLvl = async (chainString, url, timestamp) => {
           const workingSupply =
             gaugesWorkingSupply.find((g) => g.input.target.toLowerCase() == b.gauge.toLowerCase())
               ?.output / 1e18;
+          const workingBalance =
+            gaugesWorkingBalance.find((g) => g.input.target.toLowerCase() == b.gauge.toLowerCase())
+              ?.output / 1e18;
+          const totalSupply =
+            gaugesTotalSupply.find((g) => g.input.target.toLowerCase() == b.gauge.toLowerCase())
+              ?.output / 1e18;
           const relativeInflation = inflationRate * relativeWeight;
 
           // we only care about gauges that receive rewards (ie those that receive votes)
           if (relativeInflation > 0) {
-            /*
             const new_user_liquidity = this.user_liquidity.minus(this.gauge.userbalance);
             const new_user_veLIT = this.user_veLIT.minus(this.veTOKEN.userBalance);
 
+            const t = tokenlessProduction / 100;
+            const T = 1 - t;
+            const l = this.user_liquidity;
             const L = (this.user_liquidity + new_user_liquidity) * this.user_veLIT / (this.total_veLIT + new_user_veLIT);
+            const working_balance = Math.min(t.times(l).plus(T.times(L)), l);
 
-            const working_balance = min(tokenlessProduction * this.user_liquidity + (tokenlessProduction * L), this.user_liquidity)
-            const wow = working_balance / this.user_liquidity * (1 / tokenlessProduction);
-            */
+            // calculate the working supply
+            const working_ratio = workingSupply / totalSupply;
+            const new_total_liquidity = this.total_liquidity - totalSupply;
+            const new_working_supply = working_ratio.times(new_total_liquidity);
 
-
-            const bunniPrice =
+            const working_supply = workingSupply.plus(new_working_supply).minus(workingBalance).plus(working_balance);
+            if (working_supply > 0) {
+              const bunniPrice =
               token0Redeem * token0Price + token1Redeem * token1Price;
-            const annualRewardUSD =
-              relativeInflation * optionPrice * 86400 * 365;
+              const liqPrice = prices[`${chainString}:${liq[chainString]}`]
+              ? prices[`${chainString}:${liq[chainString]}`].price
+              : 0;
 
-            // if nothing has been staked, calculate what rewardApr would be if 1 wei was staked
-            const workingSupplyUSD =
-              (workingSupply > 0 ? workingSupply : 1e-18) * bunniPrice;
+              const userSupplyUsd = this.user_liquidity.times(bunniPrice);
+              const userAnnualReward = relativeInflation * 86400 * 365 / working_supply * working_balance;
+              const userAnnualRewardUSD = userAnnualReward * optionPrice;
 
-            if (workingSupplyUSD > 0) {
+            const userAnnualLiqReward = await sdk.api.abi.call({
+              target: viewHelper[chainString],
+              abi: viewHelperABI.find((n) => n.name === 'convertLitToLiq'),
+              params: [userAnnualReward],
+              chain: chainString,
+            })?.output / 1e18;
+            const userAnnualLiqRewardUSD = userAnnualLiqReward * liqPrice;
+
               rewardApr =
-                (annualRewardUSD * tokenlessProduction) / workingSupplyUSD;
-              rewardTokens = [olit[chainString]];
+              userAnnualRewardUSD.div(userSupplyUsd).times(100) * 0.75
+              + userAnnualLiqRewardUSD.div(userSupplyUsd).times(100);
+              rewardTokens = [olit[chainString], liq[chainString]];
             }
           }
         }
